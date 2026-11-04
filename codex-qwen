@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+remote="${QWEN_REMOTE:-asad@100.113.140.68}"
+key="${QWEN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+ssh_opts=(-i "$key" -o BatchMode=yes -o ConnectTimeout=8)
+
+if [[ "${1:-}" == '--fast' ]]; then
+  shift
+  remote_port=18088
+  other_port=18089
+  local_port=18188
+  context=16384
+  model=Qwen3.8-27B-Q4_K_M
+  server_script=/home/asad/bin/qwen38-dflash2-server
+  server_log=/home/asad/qwen38-dflash2-server.log
+else
+  if [[ "${1:-}" == '--full-context' ]]; then
+    shift
+  fi
+  remote_port=18089
+  other_port=18088
+  local_port=18189
+  context=262144
+  model=Qwen3.8-27B-IQ4_XS
+  server_script=/home/asad/bin/qwen38-full-server
+  server_log=/home/asad/qwen38-full-server.log
+fi
+
+# With no Codex command, offer a new session or an OpenAI session to fork.
+# Explicit commands (exec, resume, fork, etc.) keep their normal CLI behavior.
+if [[ $# -eq 0 ]]; then
+  if [[ ! -r /dev/tty ]]; then
+    echo 'Interactive terminal required; pass a Codex command for non-interactive use' >&2
+    exit 1
+  fi
+  selection=$(python3 - "${CODEX_HOME:-$HOME/.codex}/state_5.sqlite" <<'PY'
+import datetime
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+try:
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    rows = db.execute("""
+        SELECT id, COALESCE(NULLIF(name, ''), NULLIF(title, ''),
+                            NULLIF(first_user_message, ''), '(untitled)'), cwd,
+               COALESCE(NULLIF(recency_at_ms, 0), updated_at_ms,
+                        updated_at * 1000)
+        FROM threads
+        WHERE model_provider = 'openai' AND archived = 0
+        ORDER BY COALESCE(NULLIF(recency_at_ms, 0), updated_at_ms,
+                          updated_at * 1000) DESC, id DESC
+    """).fetchall()
+except (OSError, sqlite3.Error) as exc:
+    print(f"Cannot read OpenAI conversation list: {exc}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    if 'db' in locals():
+        db.close()
+
+with open('/dev/tty', 'r') as tty_in, open('/dev/tty', 'w') as tty:
+    def ask(prompt):
+        tty.write(prompt)
+        tty.flush()
+        line = tty_in.readline()
+        return line.strip() if line else 'q'
+
+    tty.write('Qwen: [1] New conversation  [2] Fork OpenAI conversation  [q] Cancel\n')
+    choice = ask('Choice: ').lower()
+    if choice == '1':
+        print('new')
+        sys.exit(0)
+    if choice != '2':
+        sys.exit(0)
+
+    query = ''
+    page = 0
+    page_size = 15
+    while True:
+        matches = [r for r in rows if query.lower() in
+                   (' '.join(str(v) for v in r[:3])).lower()]
+        start = page * page_size
+        if start >= len(matches) and page:
+            page = max(0, (len(matches) - 1) // page_size)
+            start = page * page_size
+        tty.write(f'\nOpenAI conversations: {len(matches)} matching, newest first\n')
+        for number, (session_id, title, cwd, changed) in enumerate(
+                matches[start:start + page_size], start=1):
+            date = datetime.datetime.fromtimestamp(changed / 1000).strftime('%Y-%m-%d %H:%M')
+            title = ' '.join(title.split())[:72]
+            tty.write(f'{number:2}. {date}  {title}\n'
+                      f'    {cwd}  ({session_id[:8]})\n')
+        tty.write('Enter number, n/p for pages, /text to search, / to clear, q to cancel\n')
+        value = ask('Select: ')
+        if value.lower() == 'q':
+            sys.exit(0)
+        if value.lower() == 'n':
+            if start + page_size < len(matches):
+                page += 1
+        elif value.lower() == 'p':
+            page = max(0, page - 1)
+        elif value.startswith('/'):
+            query = value[1:]
+            page = 0
+        elif value.isdigit() and 1 <= int(value) <= len(matches[start:start + page_size]):
+            print(matches[start + int(value) - 1][0])
+            sys.exit(0)
+PY
+  )
+  if [[ -z "$selection" ]]; then
+    exit 0
+  fi
+  if [[ "$selection" != new ]]; then
+    set -- fork "$selection"
+  fi
+fi
+
+command -v codex >/dev/null || { echo 'codex is not on PATH' >&2; exit 1; }
+# Allow concurrent instances: if this mode's preferred local port is taken by
+# another codex-qwen instance (or a stale tunnel), walk up until a free port.
+# The remote llama-server is shared; only the SSH tunnel port must be unique.
+if [[ -z "${QWEN_LOCAL_PORT:-}" ]]; then
+  while nc -z 127.0.0.1 "$local_port" 2>/dev/null; do
+    local_port=$((local_port + 1))
+  done
+else
+  local_port="$QWEN_LOCAL_PORT"
+fi
+if nc -z 127.0.0.1 "$local_port" 2>/dev/null; then
+  echo "Local port $local_port is already in use" >&2
+  exit 1
+fi
+
+# The HTTP server only listens on the remote loopback interface.
+ssh "${ssh_opts[@]}" "$remote" bash -s -- \
+  "$remote_port" "$other_port" "$server_script" "$server_log" <<'REMOTE'
+set -euo pipefail
+remote_port=$1
+other_port=$2
+server_script=$3
+server_log=$4
+server_pattern='^/home/asad/llama-dflash2/build/bin/llama-server .*--port '
+other_pids=$(pgrep -f "${server_pattern}${other_port}([[:space:]]|$)" || true)
+if [[ -n "$other_pids" ]]; then
+  kill $other_pids
+fi
+if ! pgrep -f "${server_pattern}${remote_port}([[:space:]]|$)" >/dev/null; then
+  nohup "$server_script" >"$server_log" 2>&1 </dev/null &
+fi
+REMOTE
+
+ssh "${ssh_opts[@]}" -o ExitOnForwardFailure=yes \
+  -N -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$remote" &
+tunnel_pid=$!
+bridge_pid=""
+trap 'kill "$tunnel_pid" $bridge_pid 2>/dev/null || true' EXIT INT TERM
+
+for _ in {1..90}; do
+  if curl -fsS "http://127.0.0.1:${local_port}/health" 2>/dev/null | grep -q '"ok"'; then
+    break
+  fi
+  if ! kill -0 "$tunnel_pid" 2>/dev/null; then
+    echo 'SSH tunnel exited before Qwen became ready' >&2
+    exit 1
+  fi
+  sleep 1
+done
+curl -fsS "http://127.0.0.1:${local_port}/health" | grep -q '"ok"' || {
+  echo "Qwen did not become ready; see $server_log on asadware" >&2
+  exit 1
+}
+
+# Adapter bridge (~/qwen-codex-bridge.py): strips OpenAI-private
+# compaction items from replayed history and truncates it to fit the
+# local context window, so OpenAI-compacted or oversized threads can
+# resume on this model. One bridge per instance, on the tunnel port + 100.
+bridge_port=$((local_port + 100))
+while nc -z 127.0.0.1 "$bridge_port" 2>/dev/null; do
+  bridge_port=$((bridge_port + 1))
+done
+bridge_budget=$((context - 20000))
+(( bridge_budget > 4000 )) || bridge_budget=4000
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bridge="${QWEN_BRIDGE:-$script_dir/qwen-codex-bridge.py}"
+[[ -f "$bridge" ]] || bridge="$HOME/qwen-codex-bridge.py"
+python3 "$bridge" --port "$bridge_port" --upstream "$local_port" \
+  --max-tokens "$bridge_budget" &
+bridge_pid=$!
+for _ in {1..30}; do
+  if curl -fsS "http://127.0.0.1:${bridge_port}/health" 2>/dev/null | grep -q '"ok"'; then
+    break
+  fi
+  if ! kill -0 "$bridge_pid" 2>/dev/null; then
+    echo 'Qwen bridge exited before it became ready' >&2
+    exit 1
+  fi
+  sleep 1
+done
+curl -fsS "http://127.0.0.1:${bridge_port}/health" | grep -q '"ok"' || {
+  echo 'Qwen bridge did not become ready' >&2
+  exit 1
+}
+
+export QWEN_LOCAL_API_KEY=local
+codex \
+  -c 'model_provider="qwen_tailscale"' \
+  -c "model_providers.qwen_tailscale={name=\"Qwen 3.8 27B\",base_url=\"http://127.0.0.1:${bridge_port}/v1\",env_key=\"QWEN_LOCAL_API_KEY\",wire_api=\"responses\",requires_openai_auth=false}" \
+  -c "model_context_window=${context}" \
+  -c 'model_reasoning_effort="high"' \
+  -m "$model" \
+  "$@"

@@ -1,0 +1,58 @@
+diff --git a/tools/server/server-chat.cpp b/tools/server/server-chat.cpp
+index a743180..d51c8a7 100644
+--- a/tools/server/server-chat.cpp
++++ b/tools/server/server-chat.cpp
+@@ -67,6 +67,18 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
+         };
+ 
+         for (json item : input_value) {
++            // Codex includes tool definitions, opaque encrypted reasoning, and
++            // OpenAI-private compaction blobs (encrypted_content is only meaningful
++            // to OpenAI's backend) in forked/resumed history. None of these is
++            // consumable by a local model; skip them (openai/codex#45393).
++            const std::string item_type = json_value(item, "type", std::string());
++            if (item_type == "additional_tools" ||
++                item_type == "compaction" ||
++                item_type == "context_compaction" ||
++                (item_type == "reasoning" &&
++                 (!exists_and_is_array(item, "content") || item.at("content").empty()))) {
++                continue;
++            }
+             bool merge_prev = !chatcmpl_messages.empty() && chatcmpl_messages.back().value("role", "") == "assistant";
+ 
+             if (exists_and_is_string(item, "content")) {
+@@ -186,16 +198,19 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
+                     item["content"] = chatcmpl_content;
+                     chatcmpl_messages.push_back(item);
+                 }
+-            } else if (exists_and_is_string(item, "arguments") &&
+-                exists_and_is_string(item, "call_id") &&
++            } else if (exists_and_is_string(item, "call_id") &&
+                 exists_and_is_string(item, "name") &&
+                 exists_and_is_string(item, "type") &&
+-                item.at("type") == "function_call"
++                ((item.at("type") == "function_call" && exists_and_is_string(item, "arguments")) ||
++                 (item.at("type") == "custom_tool_call" && exists_and_is_string(item, "input")))
+             ) {
+-                // #responses_create-input-input_item_list-item-function_tool_call
++                // Chat templates expect JSON arguments even for freeform custom tools.
++                const std::string tool_arguments = item.at("type") == "custom_tool_call"
++                    ? json({{"input", item.at("input")}}).dump()
++                    : item.at("arguments").get<std::string>();
+                 json tool_call = {
+                     {"function", json {
+-                        {"arguments", item.at("arguments")},
++                        {"arguments", tool_arguments},
+                         {"name",      item.at("name")},
+                     }},
+                     {"id",   item.at("call_id")},
+@@ -217,7 +232,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
+             } else if (exists_and_is_string(item, "call_id") &&
+                 (exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
+                 exists_and_is_string(item, "type") &&
+-                item.at("type") == "function_call_output"
++                (item.at("type") == "function_call_output" ||
++                 item.at("type") == "custom_tool_call_output")
+             ) {
+                 // #responses_create-input-input_item_list-item-function_tool_call_output
+                 if (item.at("output").is_string()) {
