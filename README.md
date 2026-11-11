@@ -51,6 +51,11 @@ Copy `server/qwen38-full-server.sh` and `server/qwen38-dflash2-server.sh` to
 `~/bin/` and edit the model paths. `--parallel 1` is deliberate (single
 slot; the bridge queues for it).
 
+Both scripts load the Qwen3.8-27B vision projector from
+`~/models/qwen38-27b-q4/mmproj-F16.gguf` with `--mmproj`, enabling Codex image
+attachments. Restart a running server after installing an updated script.
+The full-context 4090 setup leaves limited GPU memory for large image requests.
+
 ### 2. Typing machine — launcher + bridge
 
 ```bash

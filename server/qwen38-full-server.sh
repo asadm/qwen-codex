@@ -3,6 +3,7 @@ set -euo pipefail
 
 exec /home/asad/llama-dflash2/build/bin/llama-server \
   -m /home/asad/models/qwen38-27b-iq4xs/Qwen3.8-27B-IQ4_XS.gguf \
+  --mmproj /home/asad/models/qwen38-27b-q4/mmproj-F16.gguf \
   -md /home/asad/models/qwen38-27b-dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
   -a Qwen3.8-27B-IQ4_XS \
   --host 127.0.0.1 \
